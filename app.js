@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
+const path = require("path");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -8,11 +9,16 @@ const { Server } = require("socket.io");
 
 const authRoutes = require("./routes/auth");
 const conversationRoutes = require("./routes/conversations");
+const uploadRoutes = require("./routes/upload");
 const User = require("./models/User");
 const Message = require("./models/Message");
 const Conversation = require("./models/Conversation");
 
 const app = express();
+const uploadsDir = path.join(__dirname, "uploads");
+if (!require("fs").existsSync(uploadsDir)) {
+  require("fs").mkdirSync(uploadsDir, { recursive: true });
+}
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
@@ -31,6 +37,8 @@ mongoose
 
 app.use("/api/auth", authRoutes);
 app.use("/api/conversations", conversationRoutes);
+app.use("/api/upload", uploadRoutes);
+app.use("/api/upload/files", express.static(path.join(__dirname, "uploads")));
 
 io.use(async (socket, next) => {
   try {
