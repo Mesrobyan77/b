@@ -69,11 +69,47 @@ io.on("connection", async (socket) => {
 
   socket.on("send_message", async (data) => {
     try {
-      const { conversationId, text, replyTo, media, mentions, ttl } = data;
+      const { conversationId, text, replyTo, media, mentions, ttl, topicId } = data;
+
+      const conv = await Conversation.findById(conversationId);
+      if (!conv) return socket.emit("error", { error: "Conversation not found" });
+
+      const ROLE_HIERARCHY = { owner: 4, admin: 3, moderator: 2, member: 1 };
+
+      if (conv.isGroup) {
+        const member = conv.members.find((m) => m.user.toString() === userId);
+        if (!member) return socket.emit("error", { error: "Not a member" });
+        if (member.banned) return socket.emit("error", { error: "You are banned from this group" });
+        if (member.muted) {
+          if (!member.mutedUntil || new Date(member.mutedUntil) > new Date()) {
+            return socket.emit("error", { error: "You are muted in this group" });
+          }
+        }
+
+        const permLevel = conv.permissions?.["谁能发消息"] || "everyone";
+        if (permLevel === "owner" && member.role !== "owner") {
+          return socket.emit("error", { error: "Only owner can send messages" });
+        }
+        if (permLevel === "admins" && !["owner", "admin"].includes(member.role)) {
+          return socket.emit("error", { error: "Only admins can send messages" });
+        }
+
+        if (media) {
+          const mediaPerm = conv.permissions?.["谁能发媒体"] || "everyone";
+          if (mediaPerm === "owner" && member.role !== "owner") {
+            return socket.emit("error", { error: "Only owner can send media" });
+          }
+          if (mediaPerm === "admins" && !["owner", "admin"].includes(member.role)) {
+            return socket.emit("error", { error: "Only admins can send media" });
+          }
+        }
+      }
+
       const messageData = {
         conversation: conversationId,
         sender: userId,
         text: text || "",
+        topicId: topicId || null,
       };
       if (replyTo) messageData.replyTo = replyTo;
       if (media) messageData.media = media;
@@ -103,19 +139,39 @@ io.on("connection", async (socket) => {
       });
 
       if (mentions && mentions.length > 0) {
-        mentions.forEach((mentionedUserId) => {
-          const userSockets = onlineUsers.get(mentionedUserId);
-          if (userSockets) {
-            userSockets.forEach((sid) => {
-              io.to(sid).emit("mention_notification", {
-                messageId: message._id,
-                conversationId,
-                senderName: socket.user.username,
-                text: text || "",
+        const isEveryone = mentions.includes("everyone");
+        if (isEveryone && conv.isGroup) {
+          conv.participants.forEach((participantId) => {
+            if (participantId.toString() === userId) return;
+            const userSockets = onlineUsers.get(participantId.toString());
+            if (userSockets) {
+              userSockets.forEach((sid) => {
+                io.to(sid).emit("mention_notification", {
+                  messageId: message._id,
+                  conversationId,
+                  senderName: socket.user.username,
+                  text: text || "",
+                  isEveryone: true,
+                });
               });
-            });
-          }
-        });
+            }
+          });
+        } else {
+          mentions.forEach((mentionedUserId) => {
+            if (mentionedUserId === "everyone") return;
+            const userSockets = onlineUsers.get(mentionedUserId);
+            if (userSockets) {
+              userSockets.forEach((sid) => {
+                io.to(sid).emit("mention_notification", {
+                  messageId: message._id,
+                  conversationId,
+                  senderName: socket.user.username,
+                  text: text || "",
+                });
+              });
+            }
+          });
+        }
       }
     } catch (err) {
       socket.emit("error", { error: err.message });
@@ -147,7 +203,15 @@ io.on("connection", async (socket) => {
     try {
       const { messageId } = data;
       const message = await Message.findById(messageId);
-      if (!message || message.sender.toString() !== userId) return;
+      if (!message) return;
+
+      if (message.sender.toString() !== userId) {
+        const conv = await Conversation.findById(message.conversation);
+        const member = conv?.members?.find((m) => m.user.toString() === userId);
+        if (!member || !["owner", "admin"].includes(member.role)) {
+          return socket.emit("error", { error: "Not authorized" });
+        }
+      }
 
       message.deleted = true;
       message.deletedAt = new Date();
@@ -202,6 +266,17 @@ io.on("connection", async (socket) => {
 
       const conv = await Conversation.findById(message.conversation);
       if (!conv) return;
+
+      if (conv.isGroup) {
+        const member = conv.members.find((m) => m.user.toString() === userId);
+        const permLevel = conv.permissions?.["谁能置顶消息"] || "admins";
+        if (permLevel === "owner" && (!member || member.role !== "owner")) {
+          return socket.emit("error", { error: "Only owner can pin messages" });
+        }
+        if (permLevel === "admins" && (!member || !["owner", "admin"].includes(member.role))) {
+          return socket.emit("error", { error: "Only admins can pin messages" });
+        }
+      }
 
       message.pinned = !message.pinned;
       message.pinnedAt = message.pinned ? new Date() : null;

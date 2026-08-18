@@ -10,7 +10,7 @@ const reactionSchema = new mongoose.Schema(
 
 const mediaSchema = new mongoose.Schema(
   {
-    type: { type: String, enum: ["image", "video", "audio", "file", "voice", "gif", "sticker"], required: true },
+    type: { type: String, enum: ["image", "video", "audio", "file", "voice", "video_message", "gif", "sticker"], required: true },
     url: { type: String, required: true },
     name: { type: String, default: "" },
     size: { type: Number, default: 0 },
@@ -27,6 +27,10 @@ const messageSchema = new mongoose.Schema(
       ref: "Conversation",
       required: true,
     },
+    topicId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
     sender: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -36,6 +40,11 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: "",
       trim: true,
+    },
+    type: {
+      type: String,
+      enum: ["message", "system", "poll", "welcome"],
+      default: "message",
     },
     read: {
       type: Boolean,
