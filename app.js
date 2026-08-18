@@ -13,6 +13,7 @@ const uploadRoutes = require("./routes/upload");
 const User = require("./models/User");
 const Message = require("./models/Message");
 const Conversation = require("./models/Conversation");
+const SyncSession = require("./models/SyncSession");
 
 const app = express();
 const uploadsDir = path.join(__dirname, "uploads");
@@ -413,6 +414,223 @@ io.on("connection", async (socket) => {
       senderSocketId: socket.id,
     });
   });
+
+  // ── SyncPlay (Watch Together) ──────────────────────────────────
+
+  function extractYouTubeId(url) {
+    const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
+    return match ? match[1] : null;
+  }
+
+  socket.on("syncplay:start", async (data) => {
+    try {
+      const { conversationId, url } = data;
+      const videoId = extractYouTubeId(url);
+      if (!videoId) return socket.emit("error", { error: "Invalid YouTube URL" });
+
+      const conv = await Conversation.findById(conversationId);
+      if (!conv) return socket.emit("error", { error: "Conversation not found" });
+
+      let session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (session) {
+        session.videoUrl = url;
+        session.videoId = videoId;
+        session.currentTime = 0;
+        session.isPlaying = false;
+        if (!session.participants.includes(userId)) {
+          session.participants.push(userId);
+        }
+        await session.save();
+      } else {
+        session = await SyncSession.create({
+          conversation: conversationId,
+          videoUrl: url,
+          videoId,
+          startedBy: userId,
+          participants: [userId],
+        });
+      }
+
+      const populated = await session.populate("participants", "username online");
+      io.to(conversationId).emit("syncplay:state", { session: populated });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:join", async (data) => {
+    try {
+      const { conversationId } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return socket.emit("error", { error: "No active session" });
+
+      if (!session.participants.includes(userId)) {
+        session.participants.push(userId);
+        await session.save();
+      }
+
+      const populated = await session.populate("participants", "username online");
+      socket.emit("syncplay:state", { session: populated });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:leave", async (data) => {
+    try {
+      const { conversationId } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.participants = session.participants.filter((p) => p.toString() !== userId);
+      if (session.participants.length === 0) {
+        session.active = false;
+        await session.save();
+        return io.to(conversationId).emit("syncplay:ended", { conversationId });
+      }
+      await session.save();
+
+      const populated = await session.populate("participants", "username online");
+      io.to(conversationId).emit("syncplay:state", { session: populated });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:play", async (data) => {
+    try {
+      const { conversationId, currentTime } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.isPlaying = true;
+      if (typeof currentTime === "number") session.currentTime = currentTime;
+      await session.save();
+
+      io.to(conversationId).emit("syncplay:action", {
+        action: "play",
+        currentTime: session.currentTime,
+        userId,
+      });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:pause", async (data) => {
+    try {
+      const { conversationId, currentTime } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.isPlaying = false;
+      if (typeof currentTime === "number") session.currentTime = currentTime;
+      await session.save();
+
+      io.to(conversationId).emit("syncplay:action", {
+        action: "pause",
+        currentTime: session.currentTime,
+        userId,
+      });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:seek", async (data) => {
+    try {
+      const { conversationId, currentTime } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.currentTime = currentTime;
+      await session.save();
+
+      io.to(conversationId).emit("syncplay:action", {
+        action: "seek",
+        currentTime,
+        userId,
+      });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:add", async (data) => {
+    try {
+      const { conversationId, url, title } = data;
+      const videoId = extractYouTubeId(url);
+      if (!videoId) return socket.emit("error", { error: "Invalid YouTube URL" });
+
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return socket.emit("error", { error: "No active session" });
+
+      session.queue.push({ url, videoId, title: title || "", addedBy: userId });
+      await session.save();
+
+      io.to(conversationId).emit("syncplay:queue", { queue: session.queue });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:remove", async (data) => {
+    try {
+      const { conversationId, queueId } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.queue = session.queue.filter((q) => q._id.toString() !== queueId);
+      await session.save();
+
+      io.to(conversationId).emit("syncplay:queue", { queue: session.queue });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:next", async (data) => {
+    try {
+      const { conversationId } = data;
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session || session.queue.length === 0) return;
+
+      const next = session.queue.shift();
+      session.videoUrl = next.url;
+      session.videoId = next.videoId;
+      session.title = next.title;
+      session.currentTime = 0;
+      session.isPlaying = true;
+      await session.save();
+
+      const populated = await session.populate("participants", "username online");
+      io.to(conversationId).emit("syncplay:state", { session: populated });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  socket.on("syncplay:chat", async (data) => {
+    try {
+      const { conversationId, text } = data;
+      if (!text || !text.trim()) return;
+
+      const session = await SyncSession.findOne({ conversation: conversationId, active: true });
+      if (!session) return;
+
+      session.chat.push({ sender: userId, text: text.trim() });
+      await session.save();
+
+      const msg = session.chat[session.chat.length - 1];
+      const populated = await SyncSession.populate(msg, { path: "sender", select: "username" });
+
+      io.to(conversationId).emit("syncplay:chat", { message: populated });
+    } catch (err) {
+      socket.emit("error", { error: err.message });
+    }
+  });
+
+  // ── End SyncPlay ──────────────────────────────────────────────
 
   socket.on("disconnect", async () => {
     console.log(`User disconnected: ${socket.user.username} (${socket.id})`);
